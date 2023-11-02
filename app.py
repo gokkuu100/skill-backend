@@ -1,16 +1,34 @@
 from flask import Flask, request, jsonify, abort
+from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from flask_bcrypt import generate_password_hash, check_password_hash
+from flask_mail import Mail, Message
 from flask_migrate import Migrate
 from datetime import datetime
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///skill_code.db' 
 app.config['JWT_SECRET_KEY'] = '\x85\xcaUg\xba\xa4nT\x12r\xc9a/(\xae'
+cors = CORS(app)
 jwt = JWTManager(app)
 db = SQLAlchemy(app)
 migrate = Migrate(app, db)
+
+app.config['MAIL_SERVER'] = 'smtp.gmail.com'
+app.config['MAIL_PORT'] = 587
+app.config['MAIL_USE_TLS'] = True
+app.config['MAIL_USE_SSL'] = False
+app.config['MAIL_USERNAME'] = 'princewalter422@gmail.com'
+app.config['MAIL_PASSWORD'] = ''
+
+mail = Mail(app)
+
+# Send email invitation
+def send_invitation_email(student_email, assessment_title):
+    msg = Message('Assessment Invitation', sender='princewalter422@gmail.com', recipients=[student_email])
+    msg.body = f'You have been invited to participate in the assessment: {assessment_title}. Login to your account to accept the invitation.'
+    mail.send(msg)
 
 
 # Mentor model
@@ -74,6 +92,15 @@ class Grade(db.Model):
     student_id = db.Column(db.Integer, db.ForeignKey('student.id'))
     assessment_id = db.Column(db.Integer, db.ForeignKey('assessment.id'))
     score = db.Column(db.Float)
+
+# Notification model
+class Notification(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    mentor_id = db.Column(db.Integer, db.ForeignKey('mentor.id'))
+    student_id = db.Column(db.Integer, db.ForeignKey('student.id'))
+    assessment_id = db.Column(db.Integer, db.ForeignKey('assessment.id'))
+    is_accepted = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
 # Route for mentor to sign-up
@@ -169,7 +196,7 @@ def student_signup():
     db.session.commit()
 
     access_token = create_access_token(identity={'email': email, 'role': 'student', 'student_id': new_student.id})
-    return jsonify(access_token=access_token), 200
+    return jsonify(message="User created", access_token=access_token), 200
 
 # Route for student login
 @app.route('/students/login', methods=['POST'])
@@ -401,6 +428,87 @@ def view_student_grades(student_id, assessment_id):
     }
 
     return jsonify(grade_data)
+@app.route('/send_invitations', methods=['POST'])
+@jwt_required()
+def send_invitations():
+    data = request.get_json()
+    assessment_id = data.get('assessment_id')
+    student_emails = data.get('student_emails')
     
+    # Get the mentor_id from the token
+    mentor_id = get_jwt_identity().get('mentor_id')
+
+    # Check if the assessment belongs to the logged-in mentor
+    assessment = Assessment.query.filter_by(id=assessment_id, mentor_id=mentor_id).first()
+    if not assessment:
+        abort(404, description='Assessment not found or does not belong to the mentor')
+
+    for email in student_emails:
+        student = Student.query.filter_by(email=email).first()
+        if student:
+            # Check if the student is already invited to this assessment
+            if student in assessment.students:
+                continue  
+
+            # Add student to the assessment and create a notification
+            assessment.students.append(student)
+            notification = Notification(mentor_id=mentor_id, student_id=student.id, assessment_id=assessment.id)
+            db.session.add(notification)
+            db.session.commit()
+            send_invitation_email(student.email, assessment.title)
+
+    return jsonify(message='Invitations sent successfully')
+
+@app.route('/students/notifications', methods=['GET'])
+@jwt_required()  
+def get_notifications():
+    student_id = get_jwt_identity().get('student_id')
+    notifications = Notification.query.filter_by(student_id=student_id, is_accepted=False).all()
+
+    notification_data = []
+    for notification in notifications:
+        mentor_name = Mentor.query.get(notification.mentor_id).name
+        assessment_title = Assessment.query.get(notification.assessment_id).title
+        notification_data.append({
+            'id': notification.id,
+            'mentor_name': mentor_name,
+            'assessment_title': assessment_title,
+            'created_at': notification.created_at.strftime('%Y-%m-%d %H:%M:%S')
+        })
+
+    return jsonify(notifications=notification_data)
+
+@app.route('/students/notifications/<int:notification_id>/accept', methods=['POST'])
+@jwt_required()  
+def accept_invitation(notification_id):
+    student_id = get_jwt_identity().get('student_id')
+    notification = Notification.query.filter_by(id=notification_id, student_id=student_id, is_accepted=False).first()
+
+    if not notification:
+        return jsonify(error='Invalid notification ID or already accepted'), 400
+
+    # Mark the notification as accepted
+    notification.is_accepted = True
+    db.session.commit()
+
+    return jsonify(message='Invitation accepted successfully')
+
+@app.route('/students/notifications/<int:notification_id>/decline', methods=['POST'])
+@jwt_required()  
+def decline_invitation(notification_id):
+    student_id = get_jwt_identity().get('student_id')
+    notification = Notification.query.filter_by(id=notification_id, student_id=student_id, is_accepted=False).first()
+
+    if not notification:
+        return jsonify(error='Invalid notification ID or already accepted'), 400
+
+    # Decline the notification
+    db.session.delete(notification)
+    db.session.commit()
+
+    return jsonify(message='Invitation declined')
+
+
 if __name__ == '__main__':
     app.run(debug=True)
+    
